@@ -7,6 +7,16 @@ on:
         description: Container image name/tag/digest or path to an image archive.
         required: true
         type: string
+      tag_image:
+        description: Add the image digest to the Wiz Trusted Image Database after a successful scan.
+        required: false
+        type: boolean
+        default: false
+      image_digest:
+        description: Optional image digest for wizcli tag, required for image archives and when the digest cannot be resolved locally.
+        required: false
+        type: string
+        default: ""
       scan_types:
         description: Comma-separated list of vulnerabilities, secrets, sensitive-data, software-supply-chain, malware, or all.
         required: false
@@ -97,6 +107,9 @@ on:
       wizcli_exit_code:
         description: Original Wiz CLI exit code.
         value: ${{ jobs.scan.outputs.wizcli_exit_code }}
+      trusted_image_tagged:
+        description: Whether wizcli tag successfully added the image to the Wiz Trusted Image Database.
+        value: ${{ jobs.scan.outputs.trusted_image_tagged }}
 
 permissions:
   contents: read
@@ -110,11 +123,14 @@ jobs:
       artifact_name: ${{ format('wiz-image-{0}-{1}-{2}', github.repository_id, github.run_id, github.run_attempt) }}
       artifact_url: ${{ steps.artifact.outputs.artifact-url }}
       wizcli_exit_code: ${{ steps.wiz_scan.outputs.exit_code }}
+      trusted_image_tagged: ${{ steps.wiz_tag.outputs.tagged || 'false' }}
     env:
       WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
       WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
       REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
       INPUT_IMAGE: ${{ inputs.image }}
+      INPUT_TAG_IMAGE: ${{ inputs.tag_image }}
+      INPUT_IMAGE_DIGEST: ${{ inputs.image_digest }}
       INPUT_SCAN_TYPES: ${{ inputs.scan_types }}
       INPUT_BUILD_IMAGE: ${{ inputs.build_image }}
       INPUT_PULL_IMAGE: ${{ inputs.pull_image }}
@@ -144,6 +160,28 @@ jobs:
             BLOCK|AUDIT|DISABLED) ;;
             *) echo "policy_hits must be BLOCK, AUDIT, or DISABLED" >&2; exit 2 ;;
           esac
+          if [[ "$INPUT_TAG_IMAGE" == "true" && "$INPUT_PUBLISH" != "true" ]]; then
+            echo "tag_image requires publish=true because Wiz can trust only a published successful scan" >&2
+            exit 2
+          fi
+          if [[ -n "$INPUT_IMAGE_DIGEST" && "$INPUT_TAG_IMAGE" != "true" ]]; then
+            echo "image_digest is only used when tag_image=true" >&2
+            exit 2
+          fi
+          if [[ "$INPUT_TAG_IMAGE" == "true" ]]; then
+            if [[ "$INPUT_BUILD_IMAGE" == "true" && -z "$INPUT_IMAGE_DIGEST" ]]; then
+              echo "image_digest is required when tag_image=true and build_image=true because docker build does not assign a registry digest" >&2
+              exit 2
+            fi
+            case "$INPUT_IMAGE" in
+              *.tar|*.tar.gz|*.tgz)
+                [[ -n "$INPUT_IMAGE_DIGEST" ]] || {
+                  echo "image_digest is required to tag an exported image archive" >&2
+                  exit 2
+                }
+                ;;
+            esac
+          fi
           if [[ "$INPUT_BUILD_IMAGE" == "true" ]]; then
             [[ -d "$INPUT_BUILD_CONTEXT" ]] || { echo "Build context does not exist: $INPUT_BUILD_CONTEXT" >&2; exit 2; }
             [[ -f "$INPUT_DOCKERFILE" ]] || { echo "Dockerfile does not exist: $INPUT_DOCKERFILE" >&2; exit 2; }
@@ -196,6 +234,8 @@ jobs:
           {
             echo "target=container-image"
             echo "image=$INPUT_IMAGE"
+            echo "tag_image=$INPUT_TAG_IMAGE"
+            echo "image_digest=${INPUT_IMAGE_DIGEST:-auto-resolve}"
             echo "scan_types=$INPUT_SCAN_TYPES"
             echo "repository=$GITHUB_REPOSITORY"
             echo "sha=$GITHUB_SHA"
@@ -291,6 +331,26 @@ jobs:
             echo "- Results published to Wiz: \`$INPUT_PUBLISH\`"
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$scan_rc"
+
+      - name: Add image to Wiz Trusted Image Database
+        id: wiz_tag
+        if: ${{ inputs.tag_image && steps.wiz_scan.outputs.exit_code == '0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmd=("$WIZCLI_PATH" tag "$INPUT_IMAGE" --no-color --no-style)
+          [[ -n "$INPUT_IMAGE_DIGEST" ]] && cmd+=(--digest "$INPUT_IMAGE_DIGEST")
+          [[ -n "$INPUT_PROJECTS" ]] && cmd+=(--projects "$INPUT_PROJECTS")
+
+          "${cmd[@]}" 2>&1 | tee "$REPORT_DIR/wizcli-tag.log"
+          echo "tagged=true" >> "$GITHUB_OUTPUT"
+          {
+            echo
+            echo "### Wiz Trusted Image Database"
+            echo
+            echo "- Image added with \`wizcli tag\`: \`$INPUT_IMAGE\`"
+            echo "- Digest: \`${INPUT_IMAGE_DIGEST:-resolved from the local image}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Wiz CLI reports
         id: artifact

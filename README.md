@@ -127,6 +127,38 @@ For a private registry, also pass `registry`, `registry_username`, and the
 optional `REGISTRY_PASSWORD` secret. Do not use `secrets: inherit`; pass only
 the credentials required by the workflow.
 
+### Add a trusted image to Wiz
+
+Set `tag_image: true` to run `wizcli tag` after a successful published scan and
+add the image digest to the Wiz Trusted Image Database:
+
+```yaml
+    with:
+      image: ghcr.io/example/application:1.2.3
+      build_image: false
+      pull_image: true
+      scan_types: all
+      tag_image: true
+```
+
+The image must exist locally and have a registry-assigned digest. A pulled
+registry image normally satisfies both requirements. For an exported image
+archive, a build-only image, or when Wiz CLI cannot resolve the digest locally,
+pass it explicitly:
+
+```yaml
+      image: application.tar
+      build_image: false
+      pull_image: false
+      tag_image: true
+      image_digest: sha256:0123456789abcdef...
+```
+
+`tag_image` requires `publish: true`. The workflow runs `wizcli tag` only when
+the scan exits successfully; policy failures and operational scan errors are
+never added to the trusted image database. The tag command's console output is
+included in the uploaded report artifact as `wizcli-tag.log`.
+
 ## Running both target types
 
 Call both reusable workflows as separate jobs. They can run in parallel and
