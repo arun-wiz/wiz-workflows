@@ -1,0 +1,267 @@
+name: Wiz CLI directory scan
+
+on:
+  workflow_call:
+    inputs:
+      scan_types:
+        description: Comma-separated list of vulnerabilities, sast, iac, secrets, sensitive-data, malware, software-supply-chain, ai-models, or all.
+        required: false
+        type: string
+        default: all
+      path:
+        description: Repository-relative path to scan.
+        required: false
+        type: string
+        default: .
+      policies:
+        description: Optional comma-separated exact Wiz CI/CD policy names. Defaults are derived for individual scan types; all uses tenant policy resolution.
+        required: false
+        type: string
+        default: ""
+      projects:
+        description: Optional comma-separated Wiz project IDs or supported slugs.
+        required: false
+        type: string
+        default: ""
+      applications:
+        description: Optional comma-separated Wiz code application environments.
+        required: false
+        type: string
+        default: ""
+      publish:
+        description: Publish the scan to Wiz Code & Build Scans.
+        required: false
+        type: boolean
+        default: true
+      fail_on_policy:
+        description: Fail the job when Wiz CLI returns policy failure exit code 4.
+        required: false
+        type: boolean
+        default: true
+      policy_hits:
+        description: Findings to include in reports (BLOCK, AUDIT, or DISABLED for all findings).
+        required: false
+        type: string
+        default: DISABLED
+      artifact_retention_days:
+        description: Number of days to retain GitHub scan-report artifacts.
+        required: false
+        type: number
+        default: 14
+    secrets:
+      WIZ_CLIENT_ID:
+        description: Wiz CLI CI/CD service-account client ID.
+        required: true
+      WIZ_CLIENT_SECRET:
+        description: Wiz CLI CI/CD service-account client secret.
+        required: true
+    outputs:
+      artifact_name:
+        description: Name of the uploaded GitHub artifact.
+        value: ${{ jobs.scan.outputs.artifact_name }}
+      artifact_url:
+        description: URL of the uploaded GitHub artifact.
+        value: ${{ jobs.scan.outputs.artifact_url }}
+      wizcli_exit_code:
+        description: Original Wiz CLI exit code.
+        value: ${{ jobs.scan.outputs.wizcli_exit_code }}
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Directory scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      artifact_name: ${{ format('wiz-dir-{0}-{1}-{2}', github.repository_id, github.run_id, github.run_attempt) }}
+      artifact_url: ${{ steps.artifact.outputs.artifact-url }}
+      wizcli_exit_code: ${{ steps.wiz_scan.outputs.exit_code }}
+    env:
+      WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+      WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+      INPUT_SCAN_TYPES: ${{ inputs.scan_types }}
+      INPUT_SCAN_PATH: ${{ inputs.path }}
+      INPUT_POLICIES: ${{ inputs.policies }}
+      INPUT_PROJECTS: ${{ inputs.projects }}
+      INPUT_APPLICATIONS: ${{ inputs.applications }}
+      INPUT_PUBLISH: ${{ inputs.publish }}
+      INPUT_POLICY_HITS: ${{ inputs.policy_hits }}
+      REPORT_DIR: /tmp/wiz-dir-reports
+      WIZCLI_PATH: /tmp/wizcli
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${INPUT_POLICY_HITS^^}" in
+            BLOCK|AUDIT|DISABLED) ;;
+            *) echo "policy_hits must be BLOCK, AUDIT, or DISABLED" >&2; exit 2 ;;
+          esac
+          if [[ ! -e "$INPUT_SCAN_PATH" ]]; then
+            echo "Scan path does not exist: $INPUT_SCAN_PATH" >&2
+            exit 2
+          fi
+          if (( ${{ inputs.artifact_retention_days }} < 1 || ${{ inputs.artifact_retention_days }} > 90 )); then
+            echo "artifact_retention_days must be between 1 and 90" >&2
+            exit 2
+          fi
+
+      - name: Download Wiz CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            --output "$WIZCLI_PATH" \
+            "https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64"
+          chmod 0755 "$WIZCLI_PATH"
+          "$WIZCLI_PATH" version
+
+      - name: Prepare artifact metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          "$WIZCLI_PATH" version > "$REPORT_DIR/wizcli-version.txt"
+          {
+            echo "target=directory"
+            echo "path=$INPUT_SCAN_PATH"
+            echo "scan_types=$INPUT_SCAN_TYPES"
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "sha=$GITHUB_SHA"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+          } > "$REPORT_DIR/scan-metadata.txt"
+
+      - name: Run Wiz CLI directory scan
+        id: wiz_scan
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          normalized="${INPUT_SCAN_TYPES,,}"
+          normalized="${normalized// /}"
+          [[ -n "$normalized" ]] || { echo "scan_types cannot be empty" >&2; exit 2; }
+
+          declare -A selected=()
+          IFS=',' read -r -a requested <<< "$normalized"
+          for scan_type in "${requested[@]}"; do
+            case "$scan_type" in
+              all)
+                if (( ${#requested[@]} != 1 )); then
+                  echo "Use scan_types=all by itself" >&2
+                  exit 2
+                fi
+                for item in vulnerabilities sast iac secrets sensitive-data malware software-supply-chain ai-models; do
+                  selected["$item"]=1
+                done
+                ;;
+              vulnerability|vulnerabilities) selected[vulnerabilities]=1 ;;
+              sast) selected[sast]=1 ;;
+              iac) selected[iac]=1 ;;
+              secret|secrets) selected[secrets]=1 ;;
+              data|sensitive-data|sensitive_data) selected[sensitive-data]=1 ;;
+              malware) selected[malware]=1 ;;
+              license|licenses|supply-chain|software-supply-chain|software_supply_chain) selected[software-supply-chain]=1 ;;
+              ai|ai-model|ai-models|ai_models) selected[ai-models]=1 ;;
+              *) echo "Unsupported directory scan type: $scan_type" >&2; exit 2 ;;
+            esac
+          done
+
+          cmd=("$WIZCLI_PATH" scan dir "$INPUT_SCAN_PATH")
+          cmd+=(--name "github:${GITHUB_REPOSITORY}:${GITHUB_RUN_ID}")
+          cmd+=(--scan-context-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}")
+          cmd+=(--tags "github/repository=${GITHUB_REPOSITORY}")
+          cmd+=(--tags "github/run-id=${GITHUB_RUN_ID}")
+          cmd+=(--tags "github/sha=${GITHUB_SHA}")
+          cmd+=(--by-policy-hits "${INPUT_POLICY_HITS^^}")
+          cmd+=(--no-color --no-style)
+          cmd+=(--human-output-file "$REPORT_DIR/report.txt")
+          cmd+=(--json-output-file "$REPORT_DIR/report.json")
+          cmd+=(--sarif-output-file "$REPORT_DIR/report.sarif")
+
+          [[ -n "$INPUT_PROJECTS" ]] && cmd+=(--projects "$INPUT_PROJECTS")
+          [[ -n "$INPUT_APPLICATIONS" ]] && cmd+=(--applications "$INPUT_APPLICATIONS")
+          [[ "$INPUT_PUBLISH" == "false" ]] && cmd+=(--no-publish)
+
+          if [[ "$normalized" != "all" ]]; then
+            disabled=()
+            [[ -z "${selected[vulnerabilities]:-}" ]] && disabled+=(Vulnerability)
+            [[ -z "${selected[secrets]:-}" ]] && disabled+=(Secret)
+            [[ -z "${selected[sensitive-data]:-}" ]] && disabled+=(SensitiveData)
+            [[ -z "${selected[iac]:-}" ]] && disabled+=(Misconfiguration)
+            [[ -z "${selected[software-supply-chain]:-}" ]] && disabled+=(SoftwareSupplyChain)
+            [[ -z "${selected[ai-models]:-}" ]] && disabled+=(AIModels)
+            [[ -z "${selected[sast]:-}" ]] && disabled+=(SAST)
+            [[ -z "${selected[malware]:-}" ]] && disabled+=(Malware)
+            disabled_csv=$(IFS=,; echo "${disabled[*]}")
+            cmd+=(--disabled-scanners "$disabled_csv")
+          fi
+
+          if [[ -n "$INPUT_POLICIES" ]]; then
+            cmd+=(--policies "$INPUT_POLICIES")
+          elif [[ "$normalized" != "all" ]]; then
+            policies=()
+            [[ -n "${selected[vulnerabilities]:-}" ]] && policies+=("Default vulnerabilities policy")
+            [[ -n "${selected[sast]:-}" ]] && policies+=("Default SAST policy (Wiz CI/CD scan)")
+            [[ -n "${selected[iac]:-}" ]] && policies+=("Default IaC policy")
+            [[ -n "${selected[secrets]:-}" ]] && policies+=("Default secrets policy")
+            [[ -n "${selected[sensitive-data]:-}" ]] && policies+=("Default sensitive data policy")
+            [[ -n "${selected[malware]:-}" ]] && policies+=("Default malware policy")
+            [[ -n "${selected[software-supply-chain]:-}" ]] && policies+=("Default software license policy")
+            if (( ${#policies[@]} > 0 )); then
+              policy_csv=$(IFS=,; echo "${policies[*]}")
+              cmd+=(--policies "$policy_csv")
+            fi
+          fi
+
+          set +e
+          "${cmd[@]}" 2>&1 | tee "$REPORT_DIR/wizcli.log"
+          scan_rc=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$scan_rc" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Wiz CLI directory scan"
+            echo
+            echo "- Scan types: \`$INPUT_SCAN_TYPES\`"
+            echo "- Target: \`$INPUT_SCAN_PATH\`"
+            echo "- Wiz CLI exit code: \`$scan_rc\`"
+            echo "- Results published to Wiz: \`$INPUT_PUBLISH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$scan_rc"
+
+      - name: Upload Wiz CLI reports
+        id: artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ format('wiz-dir-{0}-{1}-{2}', github.repository_id, github.run_id, github.run_attempt) }}
+          path: ${{ env.REPORT_DIR }}
+          if-no-files-found: warn
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+      - name: Enforce Wiz CLI result
+        if: always()
+        shell: bash
+        env:
+          SCAN_EXIT_CODE: ${{ steps.wiz_scan.outputs.exit_code }}
+          FAIL_ON_POLICY: ${{ inputs.fail_on_policy }}
+        run: |
+          set -euo pipefail
+          scan_rc="${SCAN_EXIT_CODE:-1}"
+          if [[ "$scan_rc" == "0" ]]; then
+            exit 0
+          fi
+          if [[ "$scan_rc" == "4" && "$FAIL_ON_POLICY" == "false" ]]; then
+            echo "Wiz policy failure was configured as non-blocking."
+            exit 0
+          fi
+          exit "$scan_rc"

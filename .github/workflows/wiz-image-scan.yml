@@ -1,0 +1,326 @@
+name: Wiz CLI container-image scan
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Container image name/tag/digest or path to an image archive.
+        required: true
+        type: string
+      scan_types:
+        description: Comma-separated list of vulnerabilities, secrets, sensitive-data, software-supply-chain, malware, or all.
+        required: false
+        type: string
+        default: all
+      build_image:
+        description: Build the image on the reusable workflow runner before scanning.
+        required: false
+        type: boolean
+        default: true
+      pull_image:
+        description: Pull the image before scanning when build_image is false.
+        required: false
+        type: boolean
+        default: true
+      build_context:
+        description: Repository-relative Docker build context.
+        required: false
+        type: string
+        default: .
+      dockerfile:
+        description: Repository-relative Dockerfile path.
+        required: false
+        type: string
+        default: Dockerfile
+      policies:
+        description: Optional comma-separated exact Wiz CI/CD policy names. Defaults are derived for individual scan types; all uses tenant policy resolution.
+        required: false
+        type: string
+        default: ""
+      projects:
+        description: Optional comma-separated Wiz project IDs or supported slugs.
+        required: false
+        type: string
+        default: ""
+      applications:
+        description: Optional comma-separated Wiz code application environments.
+        required: false
+        type: string
+        default: ""
+      registry:
+        description: Optional container registry hostname for docker login.
+        required: false
+        type: string
+        default: ""
+      registry_username:
+        description: Optional private-registry username.
+        required: false
+        type: string
+        default: ""
+      publish:
+        description: Publish the scan to Wiz Code & Build Scans.
+        required: false
+        type: boolean
+        default: true
+      fail_on_policy:
+        description: Fail the job when Wiz CLI returns policy failure exit code 4.
+        required: false
+        type: boolean
+        default: true
+      policy_hits:
+        description: Findings to include in reports (BLOCK, AUDIT, or DISABLED for all findings).
+        required: false
+        type: string
+        default: DISABLED
+      artifact_retention_days:
+        description: Number of days to retain GitHub scan-report artifacts.
+        required: false
+        type: number
+        default: 14
+    secrets:
+      WIZ_CLIENT_ID:
+        description: Wiz CLI CI/CD service-account client ID.
+        required: true
+      WIZ_CLIENT_SECRET:
+        description: Wiz CLI CI/CD service-account client secret.
+        required: true
+      REGISTRY_PASSWORD:
+        description: Optional private-registry password or token.
+        required: false
+    outputs:
+      artifact_name:
+        description: Name of the uploaded GitHub artifact.
+        value: ${{ jobs.scan.outputs.artifact_name }}
+      artifact_url:
+        description: URL of the uploaded GitHub artifact.
+        value: ${{ jobs.scan.outputs.artifact_url }}
+      wizcli_exit_code:
+        description: Original Wiz CLI exit code.
+        value: ${{ jobs.scan.outputs.wizcli_exit_code }}
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Container-image scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      artifact_name: ${{ format('wiz-image-{0}-{1}-{2}', github.repository_id, github.run_id, github.run_attempt) }}
+      artifact_url: ${{ steps.artifact.outputs.artifact-url }}
+      wizcli_exit_code: ${{ steps.wiz_scan.outputs.exit_code }}
+    env:
+      WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}
+      WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      INPUT_IMAGE: ${{ inputs.image }}
+      INPUT_SCAN_TYPES: ${{ inputs.scan_types }}
+      INPUT_BUILD_IMAGE: ${{ inputs.build_image }}
+      INPUT_PULL_IMAGE: ${{ inputs.pull_image }}
+      INPUT_BUILD_CONTEXT: ${{ inputs.build_context }}
+      INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+      INPUT_POLICIES: ${{ inputs.policies }}
+      INPUT_PROJECTS: ${{ inputs.projects }}
+      INPUT_APPLICATIONS: ${{ inputs.applications }}
+      INPUT_REGISTRY: ${{ inputs.registry }}
+      INPUT_REGISTRY_USERNAME: ${{ inputs.registry_username }}
+      INPUT_PUBLISH: ${{ inputs.publish }}
+      INPUT_POLICY_HITS: ${{ inputs.policy_hits }}
+      REPORT_DIR: /tmp/wiz-image-reports
+      WIZCLI_PATH: /tmp/wizcli
+    steps:
+      - name: Check out caller repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${INPUT_POLICY_HITS^^}" in
+            BLOCK|AUDIT|DISABLED) ;;
+            *) echo "policy_hits must be BLOCK, AUDIT, or DISABLED" >&2; exit 2 ;;
+          esac
+          if [[ "$INPUT_BUILD_IMAGE" == "true" ]]; then
+            [[ -d "$INPUT_BUILD_CONTEXT" ]] || { echo "Build context does not exist: $INPUT_BUILD_CONTEXT" >&2; exit 2; }
+            [[ -f "$INPUT_DOCKERFILE" ]] || { echo "Dockerfile does not exist: $INPUT_DOCKERFILE" >&2; exit 2; }
+          fi
+          if [[ -n "$INPUT_REGISTRY" || -n "$INPUT_REGISTRY_USERNAME" || -n "$REGISTRY_PASSWORD" ]]; then
+            [[ -n "$INPUT_REGISTRY" && -n "$INPUT_REGISTRY_USERNAME" && -n "$REGISTRY_PASSWORD" ]] || {
+              echo "registry, registry_username, and REGISTRY_PASSWORD must be supplied together" >&2
+              exit 2
+            }
+          fi
+          if (( ${{ inputs.artifact_retention_days }} < 1 || ${{ inputs.artifact_retention_days }} > 90 )); then
+            echo "artifact_retention_days must be between 1 and 90" >&2
+            exit 2
+          fi
+
+      - name: Download Wiz CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            --output "$WIZCLI_PATH" \
+            "https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64"
+          chmod 0755 "$WIZCLI_PATH"
+          "$WIZCLI_PATH" version
+
+      - name: Log in to container registry
+        if: ${{ inputs.registry != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_PASSWORD" | docker login "$INPUT_REGISTRY" \
+            --username "$INPUT_REGISTRY_USERNAME" --password-stdin
+
+      - name: Build or pull image
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$INPUT_BUILD_IMAGE" == "true" ]]; then
+            docker build --file "$INPUT_DOCKERFILE" --tag "$INPUT_IMAGE" "$INPUT_BUILD_CONTEXT"
+          elif [[ "$INPUT_PULL_IMAGE" == "true" && ! -f "$INPUT_IMAGE" ]]; then
+            docker pull "$INPUT_IMAGE"
+          fi
+
+      - name: Prepare artifact metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_DIR"
+          "$WIZCLI_PATH" version > "$REPORT_DIR/wizcli-version.txt"
+          {
+            echo "target=container-image"
+            echo "image=$INPUT_IMAGE"
+            echo "scan_types=$INPUT_SCAN_TYPES"
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "sha=$GITHUB_SHA"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+          } > "$REPORT_DIR/scan-metadata.txt"
+
+      - name: Run Wiz CLI container-image scan
+        id: wiz_scan
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          normalized="${INPUT_SCAN_TYPES,,}"
+          normalized="${normalized// /}"
+          [[ -n "$normalized" ]] || { echo "scan_types cannot be empty" >&2; exit 2; }
+
+          declare -A selected=()
+          IFS=',' read -r -a requested <<< "$normalized"
+          for scan_type in "${requested[@]}"; do
+            case "$scan_type" in
+              all)
+                if (( ${#requested[@]} != 1 )); then
+                  echo "Use scan_types=all by itself" >&2
+                  exit 2
+                fi
+                for item in vulnerabilities secrets sensitive-data software-supply-chain malware; do
+                  selected["$item"]=1
+                done
+                ;;
+              vulnerability|vulnerabilities) selected[vulnerabilities]=1 ;;
+              secret|secrets) selected[secrets]=1 ;;
+              data|sensitive-data|sensitive_data) selected[sensitive-data]=1 ;;
+              supply-chain|software-supply-chain|software_supply_chain) selected[software-supply-chain]=1 ;;
+              malware) selected[malware]=1 ;;
+              *) echo "Unsupported image scan type: $scan_type" >&2; exit 2 ;;
+            esac
+          done
+
+          cmd=("$WIZCLI_PATH" scan container-image "$INPUT_IMAGE")
+          cmd+=(--name "github:${GITHUB_REPOSITORY}:${GITHUB_RUN_ID}")
+          cmd+=(--scan-context-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_JOB}")
+          cmd+=(--tags "github/repository=${GITHUB_REPOSITORY}")
+          cmd+=(--tags "github/run-id=${GITHUB_RUN_ID}")
+          cmd+=(--tags "github/sha=${GITHUB_SHA}")
+          cmd+=(--by-policy-hits "${INPUT_POLICY_HITS^^}")
+          cmd+=(--no-color --no-style)
+          cmd+=(--human-output-file "$REPORT_DIR/report.txt")
+          cmd+=(--json-output-file "$REPORT_DIR/report.json")
+          cmd+=(--sarif-output-file "$REPORT_DIR/report.sarif")
+
+          [[ -f "$INPUT_DOCKERFILE" ]] && cmd+=(--dockerfile "$INPUT_DOCKERFILE")
+          [[ -n "$INPUT_PROJECTS" ]] && cmd+=(--projects "$INPUT_PROJECTS")
+          [[ -n "$INPUT_APPLICATIONS" ]] && cmd+=(--applications "$INPUT_APPLICATIONS")
+          [[ "$INPUT_PUBLISH" == "false" ]] && cmd+=(--no-publish)
+
+          if [[ "$normalized" != "all" ]]; then
+            disabled=()
+            [[ -z "${selected[vulnerabilities]:-}" ]] && disabled+=(Vulnerability)
+            [[ -z "${selected[secrets]:-}" ]] && disabled+=(Secret)
+            [[ -z "${selected[sensitive-data]:-}" ]] && disabled+=(SensitiveData)
+            [[ -z "${selected[software-supply-chain]:-}" ]] && disabled+=(SoftwareSupplyChain)
+            [[ -z "${selected[malware]:-}" ]] && disabled+=(Malware)
+            disabled_csv=$(IFS=,; echo "${disabled[*]}")
+            cmd+=(--disabled-scanners "$disabled_csv")
+          fi
+
+          if [[ -n "$INPUT_POLICIES" ]]; then
+            cmd+=(--policies "$INPUT_POLICIES")
+          elif [[ "$normalized" != "all" ]]; then
+            policies=()
+            [[ -n "${selected[vulnerabilities]:-}" ]] && policies+=("Default vulnerabilities policy")
+            [[ -n "${selected[secrets]:-}" ]] && policies+=("Default secrets policy")
+            [[ -n "${selected[sensitive-data]:-}" ]] && policies+=("Default sensitive data policy")
+            [[ -n "${selected[software-supply-chain]:-}" ]] && policies+=("Default software license policy")
+            [[ -n "${selected[malware]:-}" ]] && policies+=("Default malware policy")
+            policy_csv=$(IFS=,; echo "${policies[*]}")
+            cmd+=(--policies "$policy_csv")
+          fi
+
+          set +e
+          "${cmd[@]}" 2>&1 | tee "$REPORT_DIR/wizcli.log"
+          scan_rc=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$scan_rc" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Wiz CLI container-image scan"
+            echo
+            echo "- Scan types: \`$INPUT_SCAN_TYPES\`"
+            echo "- Image: \`$INPUT_IMAGE\`"
+            echo "- Wiz CLI exit code: \`$scan_rc\`"
+            echo "- Results published to Wiz: \`$INPUT_PUBLISH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$scan_rc"
+
+      - name: Upload Wiz CLI reports
+        id: artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ format('wiz-image-{0}-{1}-{2}', github.repository_id, github.run_id, github.run_attempt) }}
+          path: ${{ env.REPORT_DIR }}
+          if-no-files-found: warn
+          retention-days: ${{ inputs.artifact_retention_days }}
+
+      - name: Log out of container registry
+        if: ${{ always() && inputs.registry != '' }}
+        shell: bash
+        run: docker logout "$INPUT_REGISTRY"
+
+      - name: Enforce Wiz CLI result
+        if: always()
+        shell: bash
+        env:
+          SCAN_EXIT_CODE: ${{ steps.wiz_scan.outputs.exit_code }}
+          FAIL_ON_POLICY: ${{ inputs.fail_on_policy }}
+        run: |
+          set -euo pipefail
+          scan_rc="${SCAN_EXIT_CODE:-1}"
+          if [[ "$scan_rc" == "0" ]]; then
+            exit 0
+          fi
+          if [[ "$scan_rc" == "4" && "$FAIL_ON_POLICY" == "false" ]]; then
+            echo "Wiz policy failure was configured as non-blocking."
+            exit 0
+          fi
+          exit "$scan_rc"
