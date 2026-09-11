@@ -8,7 +8,7 @@ container-image scans.
 | Workflow | Target | Selectable scan types |
 | --- | --- | --- |
 | `wiz-dir-scan.yml` | A checked-out repository or directory | `vulnerabilities`, `sast`, `iac`, `secrets`, `sensitive-data`, `malware`, `software-supply-chain`, `ai-models`, or `all` |
-| `wiz-image-scan.yml` | A container image built by the workflow, pulled from a registry, or supplied as an image archive | `vulnerabilities`, `secrets`, `sensitive-data`, `software-supply-chain`, `malware`, or `all` |
+| `wiz-image-scan.yml` | An existing registry image or supplied image archive | `vulnerabilities`, `secrets`, `sensitive-data`, `software-supply-chain`, `malware`, or `all` |
 
 Both workflows:
 
@@ -20,6 +20,11 @@ Both workflows:
 - preserve Wiz CLI exit codes, including policy failure exit code `4`;
 - expose the artifact name, artifact URL, and Wiz CLI exit code as reusable
   workflow outputs.
+
+The repository also provides platform-agnostic composite actions for scanning a
+locally available image and tagging a successfully scanned registry digest.
+They contain no image build, registry login, pull, or push logic, so callers can
+place them between their platform-specific build and publish steps.
 
 Wiz CLI directory scans run all applicable analyzers by default. For individual
 or comma-separated selections, the workflow uses Wiz CLI's
@@ -55,7 +60,7 @@ permissions:
 
 jobs:
   wiz-directory:
-    uses: arun-wiz/wiz-workflows/.github/workflows/wiz-dir-scan.yml@v1
+    uses: arun-wiz/wiz-workflows/.github/workflows/wiz-dir-scan.yml@main
     with:
       scan_types: all
       path: .
@@ -81,11 +86,11 @@ To apply tenant-specific policies, pass their exact, case-sensitive names:
       policies: My SAST blocking policy,My secrets blocking policy
 ```
 
-## Container-image scan
+## Container-image scan workflow
 
-The default behavior builds the image in the reusable workflow's runner before
-scanning it. This avoids assuming that a Docker image built in another job is
-available on a fresh runner.
+The reusable workflow pulls and scans an existing image. It can optionally tag
+a successful scan in the Wiz Trusted Image Database. It does not build or push
+images and contains no cloud-platform-specific authentication.
 
 ```yaml
 name: Wiz image scan
@@ -100,12 +105,10 @@ permissions:
 
 jobs:
   wiz-image:
-    uses: arun-wiz/wiz-workflows/.github/workflows/wiz-image-scan.yml@v1
+    uses: arun-wiz/wiz-workflows/.github/workflows/wiz-image-scan.yml@main
     with:
-      image: local/wiz-scan:${{ github.sha }}
-      build_image: true
-      build_context: .
-      dockerfile: Dockerfile
+      image: ghcr.io/example/application:1.2.3
+      pull_image: true
       scan_types: all
       artifact_retention_days: 14
     secrets:
@@ -113,19 +116,54 @@ jobs:
       WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
 ```
 
-To scan an existing registry image, disable the build and enable pulling:
+To scan an image archive already present in the caller repository, disable
+pulling:
 
 ```yaml
     with:
-      image: ghcr.io/example/application:1.2.3
-      build_image: false
-      pull_image: true
+      image: application.tar
+      pull_image: false
       scan_types: vulnerabilities,secrets
 ```
 
 For a private registry, also pass `registry`, `registry_username`, and the
 optional `REGISTRY_PASSWORD` secret. Do not use `secrets: inherit`; pass only
 the credentials required by the workflow.
+
+## Composite image actions
+
+Use the composite actions when the image must be scanned before it is pushed.
+Because composite actions run as steps, the caller's build, scan, push, and tag
+operations share one runner and the same local Docker image:
+
+```yaml
+steps:
+  - name: Build image
+    run: docker build --tag "$IMAGE" .
+
+  - name: Scan local image
+    uses: arun-wiz/wiz-workflows/.github/actions/wiz-image-scan@main
+    with:
+      image: ${{ env.IMAGE }}
+      scan_types: all
+      wiz_client_id: ${{ secrets.WIZ_CLIENT_ID }}
+      wiz_client_secret: ${{ secrets.WIZ_CLIENT_SECRET }}
+
+  # Authenticate and push with platform-specific caller steps, setting DIGEST.
+
+  - name: Add pushed digest to Wiz Image Trust
+    uses: arun-wiz/wiz-workflows/.github/actions/wiz-image-tag@main
+    with:
+      image: ${{ env.IMAGE }}
+      image_digest: ${{ steps.push.outputs.digest }}
+      wiz_client_id: ${{ secrets.WIZ_CLIENT_ID }}
+      wiz_client_secret: ${{ secrets.WIZ_CLIENT_SECRET }}
+```
+
+The scan action applies Wiz policies and fails before the caller's push step.
+The tag action accepts the registry-assigned digest after the push. Callers are
+responsible for uploading the action's report directory, which defaults to
+`/tmp/wiz-image-reports`.
 
 ### Add a trusted image to Wiz
 
@@ -135,7 +173,6 @@ add the image digest to the Wiz Trusted Image Database:
 ```yaml
     with:
       image: ghcr.io/example/application:1.2.3
-      build_image: false
       pull_image: true
       scan_types: all
       tag_image: true
@@ -143,12 +180,10 @@ add the image digest to the Wiz Trusted Image Database:
 
 The image must exist locally and have a registry-assigned digest. A pulled
 registry image normally satisfies both requirements. For an exported image
-archive, a build-only image, or when Wiz CLI cannot resolve the digest locally,
-pass it explicitly:
+archive or when Wiz CLI cannot resolve the digest locally, pass it explicitly:
 
 ```yaml
       image: application.tar
-      build_image: false
       pull_image: false
       tag_image: true
       image_digest: sha256:0123456789abcdef...
@@ -167,7 +202,7 @@ produce independently named artifacts in the same caller run:
 ```yaml
 jobs:
   directory:
-    uses: arun-wiz/wiz-workflows/.github/workflows/wiz-dir-scan.yml@v1
+    uses: arun-wiz/wiz-workflows/.github/workflows/wiz-dir-scan.yml@main
     with:
       scan_types: all
     secrets:
@@ -175,9 +210,9 @@ jobs:
       WIZ_CLIENT_SECRET: ${{ secrets.WIZ_CLIENT_SECRET }}
 
   image:
-    uses: arun-wiz/wiz-workflows/.github/workflows/wiz-image-scan.yml@v1
+    uses: arun-wiz/wiz-workflows/.github/workflows/wiz-image-scan.yml@main
     with:
-      image: local/wiz-scan:${{ github.sha }}
+      image: ghcr.io/example/application:1.2.3
       scan_types: all
     secrets:
       WIZ_CLIENT_ID: ${{ secrets.WIZ_CLIENT_ID }}

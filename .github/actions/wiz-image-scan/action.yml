@@ -1,0 +1,144 @@
+name: Wiz CLI image scan
+description: Scan a locally available container image or image archive with Wiz CLI.
+
+inputs:
+  image:
+    description: Local container image name/tag/digest or path to an image archive.
+    required: true
+  scan_types:
+    description: Comma-separated vulnerabilities, secrets, sensitive-data, software-supply-chain, malware, or all.
+    required: false
+    default: all
+  dockerfile:
+    description: Optional Dockerfile path to include in the scan.
+    required: false
+    default: Dockerfile
+  policies:
+    description: Optional comma-separated exact Wiz CI/CD policy names.
+    required: false
+    default: ""
+  projects:
+    description: Optional comma-separated Wiz project IDs or supported slugs.
+    required: false
+    default: ""
+  applications:
+    description: Optional comma-separated Wiz code application environments.
+    required: false
+    default: ""
+  publish:
+    description: Publish the scan to Wiz Code & Build Scans.
+    required: false
+    default: "true"
+  fail_on_policy:
+    description: Fail when Wiz CLI returns policy failure exit code 4.
+    required: false
+    default: "true"
+  policy_hits:
+    description: Findings included in reports (BLOCK, AUDIT, or DISABLED).
+    required: false
+    default: DISABLED
+  report_dir:
+    description: Directory in which scan reports and logs are written.
+    required: false
+    default: /tmp/wiz-image-reports
+  wizcli_path:
+    description: Location at which Wiz CLI is installed.
+    required: false
+    default: /tmp/wizcli
+  wiz_client_id:
+    description: Wiz CLI CI/CD service-account client ID.
+    required: true
+  wiz_client_secret:
+    description: Wiz CLI CI/CD service-account client secret.
+    required: true
+
+outputs:
+  wizcli_exit_code:
+    description: Original Wiz CLI scan exit code.
+    value: ${{ steps.scan.outputs.exit_code }}
+  report_dir:
+    description: Directory containing the generated reports.
+    value: ${{ inputs.report_dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate image scan inputs
+      shell: bash
+      env:
+        INPUT_IMAGE: ${{ inputs.image }}
+        INPUT_POLICY_HITS: ${{ inputs.policy_hits }}
+        INPUT_PUBLISH: ${{ inputs.publish }}
+        INPUT_FAIL_ON_POLICY: ${{ inputs.fail_on_policy }}
+        WIZ_CLIENT_ID: ${{ inputs.wiz_client_id }}
+        WIZ_CLIENT_SECRET: ${{ inputs.wiz_client_secret }}
+      run: |
+        set -euo pipefail
+        [[ -n "$INPUT_IMAGE" ]] || { echo "image is required" >&2; exit 2; }
+        case "${INPUT_POLICY_HITS^^}" in
+          BLOCK|AUDIT|DISABLED) ;;
+          *) echo "policy_hits must be BLOCK, AUDIT, or DISABLED" >&2; exit 2 ;;
+        esac
+        [[ "$INPUT_PUBLISH" == "true" || "$INPUT_PUBLISH" == "false" ]] || {
+          echo "publish must be true or false" >&2
+          exit 2
+        }
+        [[ "$INPUT_FAIL_ON_POLICY" == "true" || "$INPUT_FAIL_ON_POLICY" == "false" ]] || {
+          echo "fail_on_policy must be true or false" >&2
+          exit 2
+        }
+        [[ -n "$WIZ_CLIENT_ID" && -n "$WIZ_CLIENT_SECRET" ]] || {
+          echo "Wiz credentials are required" >&2
+          exit 2
+        }
+
+    - name: Download Wiz CLI
+      shell: bash
+      env:
+        WIZCLI_PATH: ${{ inputs.wizcli_path }}
+      run: |
+        set -euo pipefail
+        if [[ ! -x "$WIZCLI_PATH" ]]; then
+          curl --fail --location --silent --show-error \
+            --output "$WIZCLI_PATH" \
+            https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
+          chmod 0755 "$WIZCLI_PATH"
+        fi
+        "$WIZCLI_PATH" version
+
+    - name: Run Wiz CLI container-image scan
+      id: scan
+      continue-on-error: true
+      shell: bash
+      env:
+        INPUT_IMAGE: ${{ inputs.image }}
+        INPUT_SCAN_TYPES: ${{ inputs.scan_types }}
+        INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+        INPUT_POLICIES: ${{ inputs.policies }}
+        INPUT_PROJECTS: ${{ inputs.projects }}
+        INPUT_APPLICATIONS: ${{ inputs.applications }}
+        INPUT_PUBLISH: ${{ inputs.publish }}
+        INPUT_POLICY_HITS: ${{ inputs.policy_hits }}
+        REPORT_DIR: ${{ inputs.report_dir }}
+        WIZCLI_PATH: ${{ inputs.wizcli_path }}
+        WIZ_CLIENT_ID: ${{ inputs.wiz_client_id }}
+        WIZ_CLIENT_SECRET: ${{ inputs.wiz_client_secret }}
+      run: bash "${{ github.action_path }}/scan.sh"
+
+    - name: Enforce Wiz CLI scan result
+      if: always()
+      shell: bash
+      env:
+        SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit_code }}
+        FAIL_ON_POLICY: ${{ inputs.fail_on_policy }}
+      run: |
+        set -euo pipefail
+        scan_rc="${SCAN_EXIT_CODE:-1}"
+        if [[ "$scan_rc" == "0" ]]; then
+          exit 0
+        fi
+        if [[ "$scan_rc" == "4" && "$FAIL_ON_POLICY" == "false" ]]; then
+          echo "Wiz policy failure was configured as non-blocking."
+          exit 0
+        fi
+        exit "$scan_rc"

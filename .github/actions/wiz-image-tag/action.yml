@@ -1,0 +1,79 @@
+name: Wiz CLI trusted-image tag
+description: Add a previously scanned image digest to the Wiz Trusted Image Database.
+
+inputs:
+  image:
+    description: The same local image name used for the successful Wiz scan.
+    required: true
+  image_digest:
+    description: Registry-assigned image digest.
+    required: true
+  projects:
+    description: Optional comma-separated Wiz project IDs or supported slugs.
+    required: false
+    default: ""
+  report_dir:
+    description: Directory in which the tag log is written.
+    required: false
+    default: /tmp/wiz-image-reports
+  wizcli_path:
+    description: Location at which Wiz CLI is installed.
+    required: false
+    default: /tmp/wizcli
+  wiz_client_id:
+    description: Wiz CLI CI/CD service-account client ID.
+    required: true
+  wiz_client_secret:
+    description: Wiz CLI CI/CD service-account client secret.
+    required: true
+
+outputs:
+  trusted_image_tagged:
+    description: Whether the image was added to the Wiz Trusted Image Database.
+    value: ${{ steps.tag.outputs.tagged }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate trusted-image inputs
+      shell: bash
+      env:
+        INPUT_IMAGE: ${{ inputs.image }}
+        INPUT_IMAGE_DIGEST: ${{ inputs.image_digest }}
+        WIZ_CLIENT_ID: ${{ inputs.wiz_client_id }}
+        WIZ_CLIENT_SECRET: ${{ inputs.wiz_client_secret }}
+      run: |
+        set -euo pipefail
+        [[ -n "$INPUT_IMAGE" ]] || { echo "image is required" >&2; exit 2; }
+        [[ "$INPUT_IMAGE_DIGEST" == sha256:* ]] || { echo "image_digest must be a sha256 digest" >&2; exit 2; }
+        [[ -n "$WIZ_CLIENT_ID" && -n "$WIZ_CLIENT_SECRET" ]] || {
+          echo "Wiz credentials are required" >&2
+          exit 2
+        }
+
+    - name: Ensure Wiz CLI is available
+      shell: bash
+      env:
+        WIZCLI_PATH: ${{ inputs.wizcli_path }}
+      run: |
+        set -euo pipefail
+        if [[ ! -x "$WIZCLI_PATH" ]]; then
+          curl --fail --location --silent --show-error \
+            --output "$WIZCLI_PATH" \
+            https://downloads.wiz.io/v1/wizcli/latest/wizcli-linux-amd64
+          chmod 0755 "$WIZCLI_PATH"
+        fi
+        "$WIZCLI_PATH" version
+
+    - name: Add image to Wiz Trusted Image Database
+      id: tag
+      shell: bash
+      env:
+        INPUT_IMAGE: ${{ inputs.image }}
+        INPUT_IMAGE_DIGEST: ${{ inputs.image_digest }}
+        INPUT_PROJECTS: ${{ inputs.projects }}
+        REPORT_DIR: ${{ inputs.report_dir }}
+        WIZCLI_PATH: ${{ inputs.wizcli_path }}
+        WIZ_CLIENT_ID: ${{ inputs.wiz_client_id }}
+        WIZ_CLIENT_SECRET: ${{ inputs.wiz_client_secret }}
+      run: bash "${{ github.action_path }}/tag.sh"

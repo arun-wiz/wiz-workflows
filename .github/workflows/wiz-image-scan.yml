@@ -22,21 +22,11 @@ on:
         required: false
         type: string
         default: all
-      build_image:
-        description: Build the image on the reusable workflow runner before scanning.
-        required: false
-        type: boolean
-        default: true
       pull_image:
-        description: Pull the image before scanning when build_image is false.
+        description: Pull the image before scanning.
         required: false
         type: boolean
         default: true
-      build_context:
-        description: Repository-relative Docker build context.
-        required: false
-        type: string
-        default: .
       dockerfile:
         description: Repository-relative Dockerfile path.
         required: false
@@ -132,9 +122,7 @@ jobs:
       INPUT_TAG_IMAGE: ${{ inputs.tag_image }}
       INPUT_IMAGE_DIGEST: ${{ inputs.image_digest }}
       INPUT_SCAN_TYPES: ${{ inputs.scan_types }}
-      INPUT_BUILD_IMAGE: ${{ inputs.build_image }}
       INPUT_PULL_IMAGE: ${{ inputs.pull_image }}
-      INPUT_BUILD_CONTEXT: ${{ inputs.build_context }}
       INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
       INPUT_POLICIES: ${{ inputs.policies }}
       INPUT_PROJECTS: ${{ inputs.projects }}
@@ -169,10 +157,6 @@ jobs:
             exit 2
           fi
           if [[ "$INPUT_TAG_IMAGE" == "true" ]]; then
-            if [[ "$INPUT_BUILD_IMAGE" == "true" && -z "$INPUT_IMAGE_DIGEST" ]]; then
-              echo "image_digest is required when tag_image=true and build_image=true because docker build does not assign a registry digest" >&2
-              exit 2
-            fi
             case "$INPUT_IMAGE" in
               *.tar|*.tar.gz|*.tgz)
                 [[ -n "$INPUT_IMAGE_DIGEST" ]] || {
@@ -181,10 +165,6 @@ jobs:
                 }
                 ;;
             esac
-          fi
-          if [[ "$INPUT_BUILD_IMAGE" == "true" ]]; then
-            [[ -d "$INPUT_BUILD_CONTEXT" ]] || { echo "Build context does not exist: $INPUT_BUILD_CONTEXT" >&2; exit 2; }
-            [[ -f "$INPUT_DOCKERFILE" ]] || { echo "Dockerfile does not exist: $INPUT_DOCKERFILE" >&2; exit 2; }
           fi
           if [[ -n "$INPUT_REGISTRY" || -n "$INPUT_REGISTRY_USERNAME" || -n "$REGISTRY_PASSWORD" ]]; then
             [[ -n "$INPUT_REGISTRY" && -n "$INPUT_REGISTRY_USERNAME" && -n "$REGISTRY_PASSWORD" ]] || {
@@ -215,13 +195,11 @@ jobs:
           printf '%s' "$REGISTRY_PASSWORD" | docker login "$INPUT_REGISTRY" \
             --username "$INPUT_REGISTRY_USERNAME" --password-stdin
 
-      - name: Build or pull image
+      - name: Pull image
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$INPUT_BUILD_IMAGE" == "true" ]]; then
-            docker build --file "$INPUT_DOCKERFILE" --tag "$INPUT_IMAGE" "$INPUT_BUILD_CONTEXT"
-          elif [[ "$INPUT_PULL_IMAGE" == "true" && ! -f "$INPUT_IMAGE" ]]; then
+          if [[ "$INPUT_PULL_IMAGE" == "true" && ! -f "$INPUT_IMAGE" ]]; then
             docker pull "$INPUT_IMAGE"
           fi
 
